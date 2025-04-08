@@ -36,7 +36,8 @@ namespace UWPMpvDemo
             mpvClient = new MpvClient();
             mpvClient.Initialize();
             mpvRender = new MpvRender(mpvClient);
-            mpvRender.Initialize(SwapChainPanel, LibMpv.tempVideo);
+            //mpvRender.Initialize(SwapChainPanel, LibMpv.tempVideo);
+            mpvRender.Initialize(SwapChainPanel, LibMpv.tempVideoM4s, LibMpv.tempAudioM4s);
         }
 
         private void PlayPause_Click(object sender, RoutedEventArgs e)

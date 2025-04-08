@@ -1,12 +1,17 @@
 ﻿using System;
+using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace UWPMpvDemo
 {
     public class MpvClient : IDisposable
     {
-        private const int MpvFormatString = 1;
+        private const int MpvFormatString = 1; 
+        private const int MpvEventError = 2; 
+        private const int MpvEventLogMessage = 11;
         private IntPtr _libMpvDll;
         private IntPtr _mpvHandle;
 
@@ -52,6 +57,29 @@ namespace UWPMpvDemo
         private delegate void MpvFree(IntPtr data);
         private MpvFree _mpvFree;
 
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        public delegate void MpvEventCallback(IntPtr userData);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr MpvCreateClient(IntPtr mpvHandle, string name);
+        private MpvCreateClient _mpvCreateClient;
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int MpvObserveProperty(IntPtr mpvHandle, ulong replyUserData, byte[] name, int format);
+        private MpvObserveProperty _mpvObserveProperty;
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int MpvRequestEvent(IntPtr mpvHandle, int eventId, int enable);
+        private MpvRequestEvent _mpvRequestEvent;
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr MpvWaitEvent(IntPtr mpvHandle, double timeout);
+        private MpvWaitEvent _mpvWaitEvent;
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int MpvSetWakeupCallback(IntPtr mpvHandle, MpvEventCallback callback, IntPtr userData);
+        private MpvSetWakeupCallback _mpvSetWakeupCallback;
+
         public IntPtr MpvHandle => _mpvHandle;
 
         public IntPtr LibMpvDll => _libMpvDll;
@@ -76,6 +104,11 @@ namespace UWPMpvDemo
             MpvGetPropertyString = (MpvGetPropertystringFunc)GetDllType(typeof(MpvGetPropertystringFunc), "mpv_get_property");
             _mpvSetProperty = (MpvSetProperty)GetDllType(typeof(MpvSetProperty), "mpv_set_property");
             _mpvFree = (MpvFree)GetDllType(typeof(MpvFree), "mpv_free");
+            _mpvCreateClient = (MpvCreateClient)GetDllType(typeof(MpvCreateClient), "mpv_create_client");
+            _mpvObserveProperty = (MpvObserveProperty)GetDllType(typeof(MpvObserveProperty), "mpv_observe_property");
+            _mpvRequestEvent = (MpvRequestEvent)GetDllType(typeof(MpvRequestEvent), "mpv_request_event");
+            _mpvWaitEvent = (MpvWaitEvent)GetDllType(typeof(MpvWaitEvent), "mpv_wait_event");
+            _mpvSetWakeupCallback = (MpvSetWakeupCallback)GetDllType(typeof(MpvSetWakeupCallback), "mpv_set_wakeup_callback");
         }
 
         public void DoMpvCommand(params string[] args)
@@ -105,6 +138,190 @@ namespace UWPMpvDemo
             Marshal.Copy(byteArrayPointers, 0, rootPointer, numberOfStrings);
             return rootPointer;
         }
+
+        public void SetupEventListening()
+        {
+            if (_mpvHandle == IntPtr.Zero)
+                return;
+
+            // 启用事件
+            _mpvRequestEvent(_mpvHandle, 1, 1); // MPV_EVENT_PROPERTY_CHANGE
+            _mpvRequestEvent(_mpvHandle, 2, 1); // MPV_EVENT_ERROR
+            _mpvRequestEvent(_mpvHandle, 11, 1); // MPV_EVENT_LOG_MESSAGE (新增)
+
+            // 设置唤醒回调
+            var callback = new MpvEventCallback(HandleMpvEvent);
+            _mpvSetWakeupCallback(_mpvHandle, callback, IntPtr.Zero);
+
+            // 观察一些常用属性
+            ObserveProperty("time-pos");
+            ObserveProperty("pause");
+            ObserveProperty("duration");
+        }
+
+        private void ObserveProperty(string propertyName)
+        {
+            if (_mpvHandle == IntPtr.Zero)
+                return;
+
+            byte[] nameBytes = MpvUtilsExtensions.GetUtf8Bytes(propertyName);
+            _mpvObserveProperty(_mpvHandle, 0, nameBytes, MpvFormatString);
+        }
+        private void HandleMpvEvent(IntPtr userData)
+        {
+            IntPtr eventPtr = _mpvWaitEvent(_mpvHandle, 0);
+            if (eventPtr != IntPtr.Zero)
+            {
+                MpvEvent evt = Marshal.PtrToStructure<MpvEvent>(eventPtr);
+
+                switch (evt.event_id)
+                {
+                    case 1: // MPV_EVENT_PROPERTY_CHANGE
+                        Debug.WriteLine("Property changed event");
+                        break;
+
+                    case MpvEventError: // 错误事件
+                        if (evt.data != IntPtr.Zero)
+                        {
+                            string errorMsg = Marshal.PtrToStringAnsi(evt.data);
+                            Debug.WriteLine($"MPV Error: {errorMsg} (code: {evt.error})");
+                        }
+                        else
+                        {
+                            Debug.WriteLine($"MPV Error occurred (code: {evt.error})");
+                        }
+                        break;
+                        
+            case MpvEventLogMessage: // 处理日志消息事件
+                if (evt.data != IntPtr.Zero)
+                {
+                    MpvEventLogMessage logMsg = Marshal.PtrToStructure<MpvEventLogMessage>(evt.data);
+                    
+                    string prefix = Marshal.PtrToStringAnsi(logMsg.prefix);
+                    string level = Marshal.PtrToStringAnsi(logMsg.level);
+                    string text = Marshal.PtrToStringAnsi(logMsg.text);
+                    
+                    Console.WriteLine($"[MPV Log] [{level}] {prefix}: {text}");
+                }
+                break;
+                    default:
+                        Debug.WriteLine($"Unknown MPV event type: {evt.event_id}");
+                        break;
+                }
+            }
+        }
+
+        public void StartEventLoop()
+        {
+            Task.Run(() =>
+            {
+                while (_mpvHandle != IntPtr.Zero)
+                {
+                    IntPtr eventPtr = _mpvWaitEvent(_mpvHandle, 10);
+                    if (eventPtr != IntPtr.Zero)
+                    {
+                        try
+                        {
+                            MpvEvent evt = Marshal.PtrToStructure<MpvEvent>(eventPtr);
+                            string eventInfo = ParseMpvEvent(evt);
+                            Debug.WriteLine($"[MPV Event] {evt.event_id}: {eventInfo}");
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"[MPV Event Error] {ex.Message}");
+                        }
+                    }
+                }
+            });
+        }
+
+        private string ParseMpvEvent(MpvEvent evt)
+        {
+            try
+            {
+                switch ((MpvEventId)evt.event_id)
+                {
+                    case MpvEventId.Shutdown:
+                        return "MPV is shutting down";
+
+                    case MpvEventId.LogMessage:
+                        if (evt.data != IntPtr.Zero)
+                        {
+                            var log = Marshal.PtrToStructure<MpvEventLogMessage>(evt.data);
+                            return $"[{Marshal.PtrToStringUTF8(log.level)}] {Marshal.PtrToStringUTF8(log.prefix)}: {Marshal.PtrToStringUTF8(log.text)}";
+                        }
+                        break;
+
+                    case MpvEventId.PropertyChange:
+                        if (evt.data != IntPtr.Zero)
+                        {
+                            var prop = Marshal.PtrToStructure<MpvEventProperty>(evt.data);
+                            string propName = Marshal.PtrToStringUTF8(prop.name);
+                            string value = prop.format == 1 ? Marshal.PtrToStringUTF8(prop.data) : $"[binary data, format:{prop.format}]";
+                            return $"Property changed: {propName} = {value}";
+                        }
+                        break;
+
+                    case MpvEventId.EndFile:
+                        if (evt.data != IntPtr.Zero)
+                        {
+                            var endFile = Marshal.PtrToStructure<MpvEventEndFile>(evt.data);
+                            return $"Playback ended (reason: {GetEndFileReason(endFile.reason)}, error: {endFile.error})";
+                        }
+                        break;
+
+                    case MpvEventId.StartFile:
+                        return "Playback starting";
+
+                    case MpvEventId.FileLoaded:
+                        return "File loaded";
+
+                    case MpvEventId.VideoReconfig:
+                        return "Video reconfigured";
+
+                    case MpvEventId.AudioReconfig:
+                        return "Audio reconfigured";
+
+                    case MpvEventId.Seek:
+                        return "Seek initiated";
+
+                    case MpvEventId.PlaybackRestart:
+                        return "Playback restarted";
+
+                    case MpvEventId.ClientMessage:
+                        return "Received client message";
+
+                    case MpvEventId.QueueOverflow:
+                        return "Event queue overflow";
+
+                    case MpvEventId.Hook:
+                        return "Hook triggered";
+
+                    default:
+                        return $"Unknown event: {evt.event_id}";
+                }
+            }
+            catch (Exception ex)
+            {
+                return $"Error parsing event: {ex.Message}";
+            }
+            return "Empty event data";
+        }
+
+        private string GetEndFileReason(int reason)
+        {
+            switch (reason)
+            {
+                case 0: return "EOF/UNKNOWN";
+                case 1: return "RESTARTED";
+                case 2: return "ABORTED";
+                case 3: return "QUIT";
+                case 4: return "ERROR";
+                case 5: return "REDIRECT";
+                default: return $"UNKNOWN({reason})";
+            }
+        }
+
 
         public bool IsPaused()
         {
@@ -161,6 +378,10 @@ namespace UWPMpvDemo
                 throw new Exception("Failed to initialize mpv");
 
             _mpvInitialize.Invoke(_mpvHandle);
+
+            // 设置事件监听
+            //SetupEventListening();
+            StartEventLoop();
         }
 
         public void Dispose()

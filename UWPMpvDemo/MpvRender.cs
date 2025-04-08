@@ -6,76 +6,6 @@ using Windows.UI.Xaml.Controls;
 namespace UWPMpvDemo
 {
     /// <summary>
-    /// 用于 MPV_RENDER_PARAM_OPENGL_FBO 的结构体
-    /// </summary>
-    [StructLayout(LayoutKind.Sequential)]
-    public struct MpvOpenGlFbo
-    {
-        /// <summary>
-        /// 帧缓冲对象名称
-        /// </summary>
-        /// <remarks>
-        /// 必须是由 glGenFramebuffers() 生成的有效 FBO（已完成且可颜色渲染），或 0。
-        /// 如果值为 0，则表示 OpenGL 默认帧缓冲区。
-        /// </remarks>
-        public int fbo;
-
-        /// <summary>
-        /// 帧缓冲区的宽度
-        /// </summary>
-        public int w;
-
-        /// <summary>
-        /// 帧缓冲区的高度
-        /// </summary>
-        public int h;
-
-        /// <summary>
-        /// 底层纹理的内部格式（如 GL_RGBA8），如果未知则为 0
-        /// </summary>
-        /// <remarks>
-        /// 如果是默认帧缓冲区，可以是等效格式。
-        /// </remarks>
-        public int internal_format;
-    }
-
-    public enum MpvRenderParamType
-    {
-        Invalid = 0,
-        ApiType = 1,
-        InitParams = 2,
-        Fbo = 3,
-        FlipY = 4,
-        Depth = 5,
-        IccProfile = 6,
-        AmbientLight = 7,
-        X11Display = 8,
-        WlDisplay = 9,
-        AdvancedControl = 10,
-        NextFrameInfo = 11,
-        BlockForTargetTime = 12,
-        SkipRendering = 13,
-        DrmDisplay = 14,
-        DrmDrawSurfaceSize = 15,
-        DrmDisplayV2 = 15,
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct MpvRenderParam
-    {
-        public MpvRenderParamType type;
-        public IntPtr data;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct MpvOpenGlInitParams
-    {
-        public MpvRender.OpenGlRenderContextCallback get_proc_address;
-        public IntPtr get_proc_address_ctx;
-        public IntPtr extra_exts;
-    }
-
-    /// <summary>
     /// MPV渲染器封装类，提供对mpv渲染API的基本封装
     /// </summary>
     public class MpvRender : IDisposable
@@ -137,6 +67,101 @@ namespace UWPMpvDemo
 
             var address = EglContext.eglGetProcAddress(functionName);
             return address;
+        }
+
+        private string GenerateDashManifest(string videoUrl, string audioUrl)
+        {
+            return $@"﻿<MPD xmlns=""urn:mpeg:DASH:schema:MPD:2011"" profiles=""urn:mpeg:dash:profile:isoff-on-demand:2011"" type=""static"">
+    <Period start=""PT0S"">
+        <AdaptationSet>
+            <ContentComponent contentType=""video"" id=""1"" />
+            {videoUrl}
+        </AdaptationSet>
+        <AdaptationSet>
+            <ContentComponent contentType=""audio"" id=""2"" />
+            {audioUrl}
+        </AdaptationSet>
+    </Period>
+</MPD>";
+        }
+
+        public unsafe void Initialize(SwapChainPanel panel, string videoPath, string audioPath)
+        {
+            if (_mpvClient.MpvHandle == IntPtr.Zero)
+                throw new Exception("MpvClient has not initialized");
+            _panel = panel;
+
+            if (!_eglContext.InitializeEGL(panel))
+                throw new Exception("Failed to initialize EGL");
+
+            LoadMpvDynamic();
+
+            var oglInitParams = new MpvOpenGlInitParams();
+            oglInitParams.get_proc_address = (ctx, name) =>
+            {
+                return GetGLProcAddress(ctx, name);
+            };
+            oglInitParams.get_proc_address_ctx = IntPtr.Zero;
+            oglInitParams.extra_exts = IntPtr.Zero;
+
+            var size = Marshal.SizeOf<MpvOpenGlInitParams>();
+            var oglInitParamsBuf = new byte[size];
+
+            fixed (byte* arrPtr = oglInitParamsBuf)
+            {
+                IntPtr oglInitParamsPtr = new IntPtr(arrPtr);
+                Marshal.StructureToPtr(oglInitParams, oglInitParamsPtr, true);
+
+                MpvRenderParam* parameters = stackalloc MpvRenderParam[3];
+
+                parameters[0].type = MpvRenderParamType.ApiType;
+                parameters[0].data = Marshal.StringToHGlobalAnsi("opengl");
+
+                parameters[1].type = MpvRenderParamType.InitParams;
+                parameters[1].data = oglInitParamsPtr;
+
+                parameters[2].type = MpvRenderParamType.Invalid;
+                parameters[2].data = IntPtr.Zero;
+
+                var renderParamSize = Marshal.SizeOf<MpvRenderParam>();
+
+                var paramBuf = new byte[renderParamSize * 3];
+                fixed (byte* paramBufPtr = paramBuf)
+                {
+                    IntPtr param1Ptr = new IntPtr(paramBufPtr);
+                    Marshal.StructureToPtr(parameters[0], param1Ptr, true);
+
+                    IntPtr param2Ptr = new IntPtr(paramBufPtr + renderParamSize);
+                    Marshal.StructureToPtr(parameters[1], param2Ptr, true);
+
+                    IntPtr param3Ptr = new IntPtr(paramBufPtr + renderParamSize + renderParamSize);
+                    Marshal.StructureToPtr(parameters[2], param3Ptr, true);
+
+                    IntPtr context = new IntPtr(0);
+                    _mpvRenderContextCreate(ref context, _mpvClient.MpvHandle, param1Ptr);
+                    _mpvRenderContext = context;
+                }
+            }
+            _mpvRenderContextSetUpdateCallback(_mpvRenderContext, OnMpvRenderUpdate, IntPtr.Zero);
+
+            // 设置常用选项
+            _mpvClient.MpvSetOptionString(_mpvClient.MpvHandle, MpvUtilsExtensions.GetUtf8Bytes("keep-open"), MpvUtilsExtensions.GetUtf8Bytes("always"));
+            _mpvClient.MpvSetOptionString(_mpvClient.MpvHandle, MpvUtilsExtensions.GetUtf8Bytes("hwdec"), MpvUtilsExtensions.GetUtf8Bytes("auto-safe"));
+            _mpvClient.MpvSetOptionString(_mpvClient.MpvHandle, MpvUtilsExtensions.GetUtf8Bytes("vo"), MpvUtilsExtensions.GetUtf8Bytes("libmpv"));
+
+            // 构建命令参数数组
+            string[] command = new string[] {
+        "loadfile",
+        videoPath,
+        "replace",
+        $"audio-file={audioPath}"
+    };
+
+            // 构建命令参数 - 先加载视频
+            _mpvClient.DoMpvCommand("loadfile", videoPath, "replace");
+
+            // 然后附加音频流
+            _mpvClient.DoMpvCommand("audio-add", audioPath, "auto");
         }
 
         public unsafe void Initialize(SwapChainPanel panel, string videoPath)

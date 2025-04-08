@@ -128,7 +128,16 @@
       <DependentUpon>MainPage.xaml</DependentUpon>
     </Compile>
     <Compile Include="MpvClient.cs" />
+    <Compile Include="MpvEvent.cs" />
+    <Compile Include="MpvEventEndFile.cs" />
+    <Compile Include="MpvEventId.cs" />
+    <Compile Include="MpvEventLogMessage.cs" />
+    <Compile Include="MpvEventProperty.cs" />
+    <Compile Include="MpvOpenGlFbo.cs" />
+    <Compile Include="MpvOpenGlInitParams.cs" />
     <Compile Include="MpvRender.cs" />
+    <Compile Include="MpvRenderParam.cs" />
+    <Compile Include="MpvRenderParamType.cs" />
     <Compile Include="MpvUtilsExtensions.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
